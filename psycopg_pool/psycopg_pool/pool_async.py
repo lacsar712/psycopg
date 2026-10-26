@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import logging
 import warnings
+import contextvars
 from abc import ABC, abstractmethod
 from time import monotonic
 from types import TracebackType
 from typing import Any, Generic, cast
-from weakref import ref
+from weakref import finalize, ref
 from contextlib import asynccontextmanager, suppress
 from collections import deque
 from collections.abc import AsyncIterator
@@ -27,7 +28,7 @@ from .base import AttemptWithBackoff, BasePool
 from .errors import PoolClosed, PoolTimeout, TooManyRequests
 from ._compat import PSYCOPG_VERSION, AsyncPoolConnection, Self
 from ._acompat import ACondition, AEvent, ALock, AQueue, AWorker, agather, asleep
-from ._acompat import aspawn, current_task_name, ensure_async
+from ._acompat import aspawn, current_task, current_task_name, ensure_async
 from .sched_async import AsyncScheduler
 
 if True:  # ASYNC
@@ -41,6 +42,12 @@ else:
 
 
 logger = logging.getLogger("psycopg.pool")
+
+# The session scope currently active in the current task (async) or thread
+# (sync), if any. Set on scope entry, reset on scope exit. Each module (sync and
+# async) keeps its own variable.
+_current_session: contextvars.ContextVar[AsyncSession[Any] | None]
+_current_session = contextvars.ContextVar("psycopg_pool_session", default=None)
 
 
 class AsyncConnectionPool(Generic[ACT], BasePool):
@@ -204,6 +211,48 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
 
         logger.info("pool %r is ready to use", self.name)
 
+    def session(
+        self, timeout: float | None = None, *, bind: bool = True
+    ) -> AsyncSession[ACT]:
+        """Return a session scope pinning all its checkouts to one connection.
+
+        The returned `AsyncSession` is used as an (async) context manager.
+        All the checkouts performed in its block (using `connection()`,
+        `getconn()`, or the session itself) are served by the same
+        connection::
+
+            (async) with pool.session() as sess:
+                (async) with sess.connection() as conn:
+                    conn.execute("CREATE TEMP TABLE ...")
+                # the next block uses the very same connection/backend session
+                (async) with pool.connection() as conn:
+                    conn.execute("INSERT INTO ...")
+
+        While the scope is active, every connection obtained from the pool in
+        the current task (using `connection()`, `getconn()`, cursors,
+        transactions, pipeline, COPY, ...) is served by the same connection,
+        which is checked out of the pool only once, on the scope's first use,
+        and returned when the scope exits. PostgreSQL state tied to the
+        backend session (temporary tables, prepared statements, session
+        parameters, LISTEN, open transactions, ...) is thus preserved across
+        the whole block.
+
+        If *bind* is `!False`, the scope doesn't pin a connection itself: if it
+        is nested in an active scope on the same pool it will transparently use
+        its pinned connection, otherwise it behaves like plain pool usage.
+
+        The scope cannot be entered by two concurrent tasks, nor re-entered by
+        the same task before exiting. If the pinned connection is lost, the
+        scope is not silently rebound to another backend: subsequent checkouts
+        raise; on exit the dead connection is discarded and replaced as usual.
+
+        On scope exit, a connection left dirty (open transaction, unread
+        results, active pipeline or COPY, ...) is cleaned up using the same
+        rules applied by `putconn()`: it is never returned half-open to the
+        idle pool.
+        """
+        return AsyncSession(self, timeout=timeout, bind=bind)
+
     @asynccontextmanager
     async def connection(self, timeout: float | None = None) -> AsyncIterator[ACT]:
         """Context manager to obtain a connection from the pool.
@@ -216,6 +265,9 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
         :ref:`connection context behaviour <with-connection>` (commit/rollback
         the transaction in case of success/error). If the connection is no more
         in working state, replace it with a new one.
+
+        If called within a `session()` scope, the connection pinned to the
+        scope is returned and kept pinned for the whole scope.
         """
         conn = await self.getconn(timeout=timeout)
         try:
@@ -236,13 +288,28 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
         After using this function you *must* call a corresponding `putconn()`:
         failing to do so will deplete the pool. A depleted pool is a sad pool:
         you don't want a depleted pool.
+
+        If called within an active `session()` scope, the pinned connection is
+        returned instead of an arbitrary one.
         """
+        logger.info("connection requested from %r", self.name)
+        self._stats[self._REQUESTS_NUM] += 1
+
+        # If a session scope is active in the current task, let it serve the
+        # request: it will either return its pinned connection or bind one on
+        # first use. The pool state is not touched, so other connections stay
+        # available to other tasks.
+        sess = _current_session.get()
+        if sess is not None and sess.is_for_pool(self):
+            return cast(ACT, await sess.getconn(timeout))
+
+        return await self._getconn_unscoped(timeout)
+
+    async def _getconn_unscoped(self, timeout: float | None = None) -> ACT:
+        """The regular pool checkout path, ignoring any active session scope."""
         if timeout is None:
             timeout = self.timeout
         deadline = monotonic() + timeout
-
-        logger.info("connection requested from %r", self.name)
-        self._stats[self._REQUESTS_NUM] += 1
 
         self._check_open_getconn()
 
@@ -364,9 +431,18 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
 
         Use this function only paired with a `getconn()`. You don't need to use
         it if you use the much more comfortable `connection()` context manager.
+
+        Within an active `session()` scope, the connection is not returned to
+        the pool yet: it stays pinned until the scope exits.
         """
         # Quick check to discard the wrong connection
         self._check_pool_putconn(conn)
+
+        sess = _current_session.get()
+        if sess is not None and sess.is_for_pool(self):
+            if await sess.putconn(conn):
+                logger.info("connection kept pinned by session in %r", self.name)
+                return
 
         logger.info("returning connection to %r", self.name)
         if await self._maybe_close_connection(conn):
@@ -1011,6 +1087,293 @@ class WaitingClient(Generic[ACT]):
             self.error = error
             self._cond.notify_all()
             return True
+
+
+class AsyncSession(Generic[ACT]):
+    """A scope pinning every connection checkout to the same backend session.
+
+    Don't create instances directly: use `AsyncConnectionPool.session()`.
+    Use the object as an (async) context manager; while active, every
+    connection obtained from the pool in the current task/thread is served
+    the same connection, checked out on first use and returned on scope
+    exit.
+    """
+
+    __slots__ = (
+        "_pool",
+        "_timeout",
+        "_bind",
+        "_conn",
+        "_depth",
+        "_owner",
+        "_entered",
+        "_parent",
+        "_token",
+        "_finalizer",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        pool: AsyncConnectionPool[ACT],
+        *,
+        timeout: float | None,
+        bind: bool,
+    ):
+        self._pool = pool
+        self._timeout = timeout
+        self._bind = bind
+
+        # The connection the scope is pinned to, after the first successful
+        # checkout; None until then.
+        self._conn: ACT | None = None
+        # Number of outstanding checkouts of the pinned connection.
+        self._depth = 0
+
+        # Task (async) or thread (sync) owning an active scope; None if idle.
+        self._owner: Any = None
+        self._entered = False
+
+        # Scope active when this one was entered (for nesting), and the token
+        # to restore the context variable on exit.
+        self._parent: AsyncSession[Any] | None = None
+        self._token: contextvars.Token[Any] | None = None
+
+        # Reclaim the pinned connection if the scope is abandoned mid-use.
+        self._finalizer: Any = None
+
+    def __repr__(self) -> str:
+        state = "pinned" if self._conn is not None else "unbound"
+        return f"<{self.__class__.__name__} {self._pool.name!r} {state}>"
+
+    @property
+    def pool(self) -> AsyncConnectionPool[ACT]:
+        """The pool the scope belongs to."""
+        return self._pool
+
+    @property
+    def conn(self) -> ACT | None:
+        """The connection currently pinned, or `!None` if not pinned yet."""
+        return self._conn
+
+    @property
+    def pinned(self) -> bool:
+        """`!True` if the scope is currently pinned to a connection."""
+        return self._conn is not None
+
+    async def __aenter__(self) -> Self:
+        self._enter()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self._exit()
+
+    def _enter(self) -> None:
+        owner = current_task()
+        if self._entered:
+            if self._owner is owner:
+                raise e.ProgrammingError(
+                    "the session scope is already active in the current"
+                    " task/thread: it can't be re-entered before exiting"
+                )
+            raise e.ProgrammingError(
+                "the session scope is already active in another task/thread:"
+                " it can't be shared between concurrent tasks/threads"
+            )
+
+        self._owner = owner
+        self._parent = _current_session.get()
+        self._token = _current_session.set(self)
+        self._entered = True
+
+    async def _exit(self) -> None:
+        if not self._entered:
+            return
+
+        # Leave the scope before cleanup so that the final return goes through
+        # the regular pool path (and an enclosing scope doesn't swallow the
+        # connection returned by an exiting inner scope).
+        self._entered = False
+        self._owner = None
+        token = self._token
+        self._token = None
+        self._parent = None
+        _current_session.reset(token)  # type: ignore[arg-type]
+
+        conn = self._conn
+        depth = self._depth
+        self._conn = None
+        self._depth = 0
+
+        if self._finalizer is not None:
+            self._finalizer.detach()
+            self._finalizer = None
+
+        if conn is None:
+            return
+
+        if depth:
+            logger.warning(
+                "session scope %r exited with %d connection(s) not returned to"
+                " the pool: reclaiming the pinned connection",
+                self,
+                depth,
+            )
+
+        # A pipeline left open is session state invisible to the transaction
+        # status: the connection might look IDLE but be half-open. Discard it
+        # (it will be replaced) instead of returning it in the idle pool.
+        if conn._pipeline is not None and not conn.closed:
+            logger.warning(
+                "discarding connection pinned by session scope %r left with"
+                " a pipeline still active",
+                self,
+            )
+            conn.pgconn.finish()
+
+        # Return the pinned connection using the very same path as a regular
+        # putconn(): the pool will reset it, or discard and replace it if the
+        # session is left dirty or the connection is broken. Make sure the
+        # cleanup cannot be interrupted leaving a checked-out slot orphaned
+        # and other waiting clients stuck.
+        try:
+            if True:  # ASYNC
+                await asyncio.shield(self._pool.putconn(conn))
+            else:
+                await self._pool.putconn(conn)
+        except Exception as ex:
+            logger.warning(
+                "error returning the connection pinned by session scope" " %r: %s",
+                self,
+                ex,
+            )
+
+    def is_for_pool(self, pool: AsyncConnectionPool[Any]) -> bool:
+        """Return whether this is an active scope attached to *pool*."""
+        return self._entered and self._pool is pool
+
+    def _check_owner(self) -> None:
+        """Make sure the scope is used only by the task/thread that entered."""
+        if not self._entered:
+            raise e.ProgrammingError("the session scope is not active")
+        owner = current_task()
+        if owner is not self._owner:
+            raise e.ProgrammingError(
+                "a session scope can only be used by the task/thread that entered it"
+            )
+
+    def _same_pool_parent(self) -> AsyncSession[Any] | None:
+        """Return the closest enclosing active scope on the same pool."""
+        parent = self._parent
+        while parent is not None:
+            if parent._entered and parent._pool is self._pool:
+                return parent
+            parent = parent._parent
+        return None
+
+    async def getconn(self, timeout: float | None = None) -> ACT:
+        """Return the pinned connection, binding the scope on the first call.
+
+        Subsequent calls always return the same connection; it is never
+        re-checked or silently replaced by another backend session.
+        """
+        self._check_owner()
+
+        if self._conn is not None:
+            if self._conn.closed:
+                raise e.OperationalError(
+                    "the connection pinned to the session scope is closed: the"
+                    " scope cannot be transparently rebound to another server"
+                    " process. Exit the scope (the dead connection will be"
+                    " discarded and replaced) and open a new one"
+                )
+            self._depth += 1
+            return self._conn
+
+        if not self._bind:
+            # A non-binding scope follows an enclosing scope of the same pool,
+            # if there is one.
+            parent = self._same_pool_parent()
+            if parent is not None:
+                return cast(ACT, await parent.getconn(timeout))
+            # No usable enclosing scope: behave as regular pool usage.
+            return await self._pool._getconn_unscoped(timeout)
+
+        # The first successful checkout (including the configure/check
+        # handshake performed by the pool) pins the scope to this connection.
+        # Queueing, timeout and health checks on this first checkout follow
+        # the regular pool rules; a failure/cancellation here leaves no
+        # half-bound state.
+        logger.info("session scope binding a connection from %r", self._pool.name)
+        conn = await self._pool._getconn_unscoped(
+            timeout if timeout is not None else self._timeout
+        )
+        self._conn = conn
+        self._depth = 1
+        self._finalizer = finalize(self, _session_orphaned, self._pool, conn)
+        logger.info("session scope %r pinned to %s", self, conn)
+        return conn
+
+    async def putconn(self, conn: ACT) -> bool:
+        """Release a checkout of the pinned connection.
+
+        Return `!True` if the connection was absorbed by the scope (it stays
+        pinned until the scope exits), `!False` if it must go through the
+        regular pool return path instead.
+        """
+        self._check_owner()
+
+        if self._conn is not None:
+            if conn is self._conn:
+                # The pinned connection is only returned for good when the
+                # scope exits; absorb even unbalanced putconn() calls so that
+                # it can never leak back into the idle list mid-scope.
+                if self._depth:
+                    self._depth -= 1
+                else:
+                    logger.warning(
+                        "unexpected putconn() on the connection pinned by"
+                        " session scope %r: keeping it pinned",
+                        self,
+                    )
+                return True
+            # A connection checked out outside of the scope: return normally.
+            return False
+
+        if not self._bind:
+            parent = self._same_pool_parent()
+            if parent is not None:
+                return await parent.putconn(conn)
+
+        return False
+
+    @asynccontextmanager
+    async def connection(self, timeout: float | None = None) -> AsyncIterator[ACT]:
+        """Context manager yielding the connection pinned to the scope.
+
+        Equivalent to `AsyncConnectionPool.connection()`, but routed through
+        the scope so that every nested block uses the same connection.
+        """
+        async with self._pool.connection(timeout) as conn:
+            yield conn
+
+
+def _session_orphaned(pool: AsyncConnectionPool[Any], conn: ACT) -> None:
+    """Reclaim a pinned connection whose scope was garbage-collected active."""
+    logger.warning(
+        "session scope was garbage collected while pinning %s: reclaiming"
+        " the connection",
+        conn,
+    )
+    try:
+        pool.run_task(ReturnConnection(pool, conn, from_getconn=False))
+    except Exception:
+        pass
 
 
 class MaintenanceTask(ABC):

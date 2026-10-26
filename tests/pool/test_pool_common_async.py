@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 import psycopg
+from psycopg.pq import TransactionStatus
 
 from ..utils import set_autocommit
 from ..acompat import AEvent, asleep, gather, is_alive, skip_async, skip_sync, spawn
@@ -872,6 +873,406 @@ async def test_drain(pool_cls, dsn):
         assert len(pids3) == 2
         if pool_cls is not pool.AsyncNullConnectionPool:
             assert pids2 == pids3
+
+
+# ------------------------------------------------
+# Session scope (connection pinning) tests
+# ------------------------------------------------
+
+
+@pytest.mark.crdb_skip("backend pid")
+async def test_session_pin_connection(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 2), max_size=2) as p:
+        await p.wait()
+        sess = p.session()
+        assert not sess.pinned
+        async with sess:
+            async with sess.connection() as conn:
+                pid = conn.info.backend_pid
+            assert sess.pinned
+            # checkouts through the session and through the pool coincide
+            async with sess.connection() as conn:
+                assert conn.info.backend_pid == pid
+            async with p.connection() as conn:
+                assert conn.info.backend_pid == pid
+            conn = await sess.getconn()
+            try:
+                assert conn.info.backend_pid == pid
+            finally:
+                await sess.putconn(conn)
+
+        # the pinned connection is back in working state
+        if pool_cls is pool.AsyncConnectionPool:
+            assert len(p._pool) == 2
+            assert all(
+                c.pgconn.transaction_status == TransactionStatus.IDLE for c in p._pool
+            )
+
+        # a new scope binds independently
+        async with p.session() as sess2:
+            async with sess2.connection() as conn:
+                await conn.execute("select 1")
+
+
+async def test_session_preserves_session_state(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session():
+            async with p.connection() as conn:
+                await set_autocommit(conn, True)
+                await conn.execute("create temp table pin_test_tab as select 42 as n")
+            # a separate checkout of the scope sees the same backend state
+            async with p.connection() as conn:
+                cur = await conn.execute("select n from pin_test_tab")
+                assert (await cur.fetchone()) == (42,)
+
+
+@pytest.mark.crdb_skip("backend pid")
+async def test_session_nested_scopes(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 2), max_size=2) as p:
+        await p.wait()
+        async with p.session() as outer:
+            async with outer.connection() as conn:
+                outer_pid = conn.info.backend_pid
+
+            # a non-binding inner scope follows the outer binding
+            async with p.session(bind=False) as follower:
+                assert not follower.pinned
+                async with follower.connection() as conn:
+                    assert conn.info.backend_pid == outer_pid
+
+            # the outer binding is still there after the inner scope exits
+            async with outer.connection() as conn:
+                assert conn.info.backend_pid == outer_pid
+
+            # a binding inner scope gets a connection of its own
+            async with p.session() as inner:
+                async with inner.connection() as conn:
+                    assert conn.info.backend_pid != outer_pid
+            assert outer.pinned
+            async with outer.connection() as conn:
+                assert conn.info.backend_pid == outer_pid
+
+
+@pytest.mark.crdb_skip("backend pid")
+async def test_session_sibling_scopes(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 2), max_size=2) as p:
+        await p.wait()
+        async with p.session() as s1, p.session() as s2:
+            c1 = await s1.getconn()
+            try:
+                c2 = await s2.getconn()
+                try:
+                    assert c1.info.backend_pid != c2.info.backend_pid
+                finally:
+                    await s2.putconn(c2)
+            finally:
+                await s1.putconn(c1)
+
+
+async def test_session_reenter_same_scope(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1)) as p:
+        await p.wait()
+        sess = p.session()
+        async with sess:
+            with pytest.raises(psycopg.errors.ProgrammingError):
+                async with sess:
+                    pass
+        # the same object can be used again once properly exited
+        async with sess:
+            async with sess.connection() as conn:
+                await conn.execute("select 1")
+
+
+async def test_session_concurrent_use_fails(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1)) as p:
+        await p.wait()
+        sess = p.session()
+        errors: list[Exception] = []
+        ev = AEvent()
+
+        async with sess:
+            async with sess.connection():
+
+                async def worker():
+                    try:
+                        async with sess:
+                            pass
+                    except psycopg.errors.ProgrammingError as ex:
+                        errors.append(ex)
+                    finally:
+                        ev.set()
+
+                spawn(worker)
+                await ev.wait()
+
+        assert errors
+        assert "already active" in str(errors[0])
+
+
+@pytest.mark.timing
+async def test_session_bind_timeout(pool_cls, dsn):
+    async with pool_cls(
+        dsn, min_size=min_size(pool_cls, 1), max_size=1, timeout=5
+    ) as p:
+        await p.wait()
+        held = await p.getconn()
+        sess = p.session(timeout=0.2)
+        try:
+            t0 = time()
+            with pytest.raises(pool.PoolTimeout):
+                async with sess:
+                    async with sess.connection():
+                        pass
+            assert time() - t0 < 1.0
+            assert not sess.pinned
+        finally:
+            await p.putconn(held)
+        # the timed out scope ate no slot and left nobody waiting
+        assert not p._waiting
+        async with p.connection(timeout=2) as conn:
+            await conn.execute("select 1")
+
+
+@skip_sync
+async def test_session_bind_cancelled(pool_cls, dsn):
+    async with pool_cls(
+        dsn, min_size=min_size(pool_cls, 1), max_size=1, timeout=5
+    ) as p:
+        await p.wait()
+        held = await p.getconn()
+        sess = p.session()
+        try:
+
+            async def bind():
+                async with sess.connection():
+                    pass
+
+            t = spawn(bind)
+            await ensure_waiting(p)
+            t.cancel()
+            await gather(t, return_exceptions=True)
+            assert not sess.pinned
+        finally:
+            await p.putconn(held)
+        # the stale waiter was discarded and the slot is usable again
+        assert not p._waiting
+        async with p.connection(timeout=2) as conn:
+            await conn.execute("select 1")
+
+
+@pytest.mark.crdb_skip("pg_terminate_backend")
+async def test_session_broken_connection_not_rebound(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session() as sess:
+            conn = await sess.getconn()
+            await set_autocommit(conn, True)
+            try:
+                await conn.execute("select pg_terminate_backend(pg_backend_pid())")
+            except Exception:
+                pass
+            if not conn.closed:
+                await asleep(0.1)
+            if not conn.closed:
+                conn.pgconn.finish()
+
+            assert conn.closed
+            with pytest.raises(psycopg.OperationalError):
+                await sess.getconn()
+
+        # the dead connection was discarded and replaced, the pool serves
+        for _ in range(100):
+            try:
+                async with p.connection(timeout=1) as conn:
+                    await conn.execute("select 1")
+                break
+            except Exception:
+                await asleep(0.1)
+        else:
+            assert False, "pool never recovered after the pinned conn died"
+
+
+async def test_session_dirty_exit_is_cleaned(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session() as sess:
+            conn = await sess.getconn()
+            cur = await conn.execute("select 1")
+            assert (await cur.fetchone()) == (1,)
+            assert conn.pgconn.transaction_status == TransactionStatus.INTRANS
+
+        # not returned half-open: the open transaction was rolled back
+        if pool_cls is pool.AsyncConnectionPool:
+            assert len(p._pool) == 1
+            assert p._pool[0].pgconn.transaction_status == TransactionStatus.IDLE
+        async with p.connection() as conn:
+            await conn.execute("select 1")
+
+
+async def test_session_server_cursor_on_pinned_connection(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session() as sess:
+            async with sess.connection() as conn:
+                pid = conn.info.backend_pid
+                async with conn.cursor("sess_cur") as cur:
+                    await cur.execute("select * from generate_series(1, 5) as v")
+                    assert await cur.fetchmany(2) == [(1,), (2,)]
+            # a new checkout keeps using the same backend, with a clean txn
+            async with sess.connection() as conn:
+                assert conn.info.backend_pid == pid
+                assert conn.pgconn.transaction_status == TransactionStatus.IDLE
+                async with conn.cursor("sess_cur2") as cur2:
+                    await cur2.execute("select 1")
+                    assert await cur2.fetchone() == (1,)
+
+
+async def test_session_operations_stay_on_pinned_connection(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session() as sess:
+            async with sess.connection() as conn:
+                pid = conn.info.backend_pid
+                # execute, explicit transaction, plain cursor, pipeline, COPY
+                cur = await conn.execute("select 1")
+                assert await cur.fetchone() == (1,)
+                async with conn.transaction():
+                    cur = await conn.execute("select 2")
+                    assert await cur.fetchone() == (2,)
+                async with conn.cursor() as cur:
+                    await cur.execute("select 3")
+                    assert await cur.fetchone() == (3,)
+                async with conn.pipeline():
+                    await conn.execute("select 4")
+                data = bytearray()
+                async with conn.cursor() as ccur:
+                    async with ccur.copy("copy (select 5) to stdout") as cp:
+                        async for block in cp:
+                            data.extend(block)
+                assert bytes(data).strip() == b"5"
+                async with conn.cursor() as mcur:
+                    await mcur.executemany("select %s", [(6,), (7,)])
+            # a later block still talks to the same backend
+            async with p.connection() as conn:
+                assert conn.info.backend_pid == pid
+
+
+async def test_session_open_pipeline_discarded(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=1) as p:
+        await p.wait()
+        async with p.session() as sess:
+            conn = await sess.getconn()
+            pipe = conn.pipeline()
+            await pipe.__aenter__()
+            await conn.execute("select 1")
+            assert conn._pipeline is not None
+            # leave the pipeline explicitly open on scope exit
+
+        # the conn with an active pipeline is discarded, not put in the pool
+        for _ in range(100):
+            try:
+                async with p.connection(timeout=1) as conn:
+                    await conn.execute("select 1")
+                break
+            except Exception:
+                await asleep(0.1)
+        else:
+            assert False, "pool never recovered after a dirty pipeline"
+
+
+@pytest.mark.crdb_skip("backend pid")
+async def test_session_other_clients_unblocked(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 2), max_size=2) as p:
+        await p.wait()
+        pids: list[int] = []
+        pinned_ready = AEvent()
+        release = AEvent()
+
+        # each task enters its own scope, so no scope is shared by tasks
+        async def session_user():
+            async with p.session() as sess:
+                async with sess.connection() as conn:
+                    pids.append(conn.info.backend_pid)
+                    pinned_ready.set()
+                    await release.wait()
+
+        async def other_user():
+            await pinned_ready.wait()
+            async with p.connection(timeout=2) as conn:
+                pids.append(conn.info.backend_pid)
+                release.set()
+
+        t1 = spawn(session_user)
+        t2 = spawn(other_user)
+        await gather(t1, t2, timeout=10)
+        assert len(pids) == 2
+        assert pids[0] != pids[1]
+
+
+@pytest.mark.crdb_skip("backend pid")
+async def test_session_close_returns_keeps_pin(pool_cls, dsn):
+    if pool_cls is pool.AsyncNullConnectionPool:
+        # close_returns is force-disabled on null pools
+        return
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), close_returns=True) as p:
+        await p.wait()
+        async with p.session() as sess:
+            conn = await sess.getconn()
+            pid = conn.info.backend_pid
+            # with close_returns, close() is equivalent to putconn(): the
+            # connection is kept pinned for the whole scope
+            await conn.close()
+            assert not conn.closed
+            conn = await sess.getconn()
+            try:
+                assert conn.info.backend_pid == pid
+            finally:
+                await sess.putconn(conn)
+
+
+async def test_session_putconn_foreign_connection(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1), max_size=2) as p:
+        await p.wait()
+        conn = await p.getconn()
+        # checked out before entering the scope: returned through the
+        # regular path, not swallowed by the (unbound) scope
+        async with p.session():
+            await p.putconn(conn)
+        async with p.connection() as c:
+            await c.execute("select 1")
+
+
+async def test_session_nonbinding_without_parent(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1)) as p:
+        await p.wait()
+        async with p.session(bind=False) as sess:
+            assert not sess.pinned
+            async with sess.connection() as conn:
+                await conn.execute("select 1")
+            assert not sess.pinned
+
+
+async def test_session_exception_in_block(pool_cls, dsn):
+    async with pool_cls(dsn, min_size=min_size(pool_cls, 1)) as p:
+        await p.wait()
+        with pytest.raises(RuntimeError):
+            async with p.session() as sess:
+                async with sess.connection() as conn:
+                    await conn.execute("select 1")
+                    raise RuntimeError("boom")
+        async with p.connection() as conn:
+            await conn.execute("select 1")
+
+
+async def test_session_close_pool_during_scope(pool_cls, dsn):
+    p = pool_cls(dsn, min_size=min_size(pool_cls, 1), open=False)
+    await p.open(wait=True)
+    async with p.session() as sess:
+        async with sess.connection():
+            pass
+        await p.close()
+    assert p.closed
 
 
 def min_size(pool_cls, num=1):
