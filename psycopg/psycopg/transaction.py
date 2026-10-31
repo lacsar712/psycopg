@@ -17,6 +17,7 @@ from . import pq, sql
 from .abc import ConnectionType, PQGen
 from ._compat import Self
 from .pq.misc import connection_summary
+from ._profile import AutocommitOverlay
 
 if TYPE_CHECKING:
     from .connection import Connection
@@ -96,11 +97,26 @@ class BaseTransaction(Generic[ConnectionType]):
         sp = f"{self.savepoint_name!r} " if self.savepoint_name else ""
         return f"<{cls} {sp}({self.status.value}) {info} at 0x{id(self):x}>"
 
-    def _check_enter(self) -> None:
-        if self.status != self.Status.NOT_STARTED:
-            raise TypeError("transaction blocks can be used only once")
+    def _check_profile_enter(self) -> None:
+        """Transaction entry exit: read the frame ``autocommit_overlay``.
+
+        A ``force_on`` frame promises autocommit-like delivery, so opening a
+        transaction (outer or nested savepoint) inside it is refused outright
+        instead of enrolling statements in a BEGIN/savepoint. This read is
+        deliberately separate from the pipeline_admit checks.
+        """
+        if self._conn._profiles.autocommit_overlay is AutocommitOverlay.FORCE_ON:
+            raise e.ProgrammingError(
+                "transaction() rejected by the active execution profile"
+                " (autocommit_overlay=force_on): the frame requires"
+                " autocommit-like execute and cannot open a transaction"
+                " or savepoint"
+            )
 
     def _enter_gen(self) -> PQGen[None]:
+        if self.status != self.Status.NOT_STARTED:
+            raise TypeError("transaction blocks can be used only once")
+        self._check_profile_enter()
         self.status = self.Status.ACTIVE
 
         self._push_savepoint()
@@ -113,6 +129,14 @@ class BaseTransaction(Generic[ConnectionType]):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> PQGen[bool]:
+        # Transaction exit exit: read the frame autocommit_overlay as well.
+        # Entering under force_on is already refused and pushing force_on on
+        # top of an open transaction is refused too, so reaching this point
+        # with force_on means the stack was tampered with: fail explicitly.
+        if self._conn._profiles.autocommit_overlay is AutocommitOverlay.FORCE_ON:
+            raise e.ProgrammingError(
+                "cannot exit a transaction under autocommit_overlay=force_on"
+            )
         if not exc_val and not self.force_rollback:
             yield from self._commit_gen()
             return False
@@ -259,17 +283,7 @@ class Transaction(BaseTransaction["Connection[Any]"]):
 
     def __enter__(self) -> Self:
         with self._conn.lock:
-            self._check_enter()
-            try:
-                self._conn.wait(self._enter_gen())
-            except BaseException as ex:
-                # Undo the enter if it was interrupted (e.g. by Ctrl-C)
-                # as __exit__ won't be called.
-                if self.pgconn.status == OK:
-                    self._conn.wait(self._exit_gen(type(ex), ex, None))
-                else:
-                    self.status = self.Status.FAILED
-                raise
+            self._conn.wait(self._enter_gen())
         return self
 
     def __exit__(
@@ -303,17 +317,7 @@ class AsyncTransaction(BaseTransaction["AsyncConnection[Any]"]):
 
     async def __aenter__(self) -> Self:
         async with self._conn.lock:
-            self._check_enter()
-            try:
-                await self._conn.wait(self._enter_gen())
-            except BaseException as ex:
-                # Undo the enter if it was interrupted (e.g. by a cancellation)
-                # as __aexit__ won't be called.
-                if self.pgconn.status == OK:
-                    await self._conn.wait(self._exit_gen(type(ex), ex, None))
-                else:
-                    self.status = self.Status.FAILED
-                raise
+            await self._conn.wait(self._enter_gen())
         return self
 
     async def __aexit__(

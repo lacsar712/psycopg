@@ -25,6 +25,15 @@ from .adapt import AdaptersMap
 from ._enums import IsolationLevel
 from ._compat import LiteralString, Self, TypeVar
 from .pq.misc import connection_summary
+from ._profile import (
+    AutocommitOverlay,
+    CancelSurface,
+    ExecProfile,
+    ExecProfileStack,
+    PipelineAdmit,
+    PrepareBind,
+    _ExecProfileContext,
+)
 from ._preparing import PrepareManager
 from ._capabilities import capabilities
 from ._pipeline_base import BasePipeline
@@ -112,6 +121,16 @@ class BaseConnection(Generic[Row]):
         self._closed = False  # closed by an explicit close()
         self._prepared: PrepareManager = PrepareManager()
         self._tpc: tuple[Xid, bool] | None = None  # xid, prepared
+
+        # Connection-scoped execution profile policy stack. Owned by this
+        # instance (never a process global/ContextVar): two connections keep
+        # independent stacks even on the same thread or asyncio task.
+        self._profiles: ExecProfileStack = ExecProfileStack(self)
+
+        # Bumped every time cancel() actually dispatches a cancellation
+        # request to the backend. Execute boundaries snapshot it in order to
+        # apply the top frame's cancel_surface policy deterministically.
+        self._cancel_generation: int = 0
 
         # Gather notifies when the notifies() generator is not running.
         # It will be set to None during `notifies()` generator run.
@@ -298,6 +317,10 @@ class BaseConnection(Generic[Row]):
         if self._should_cancel():
             c = self.pgconn.get_cancel()
             c.cancel()
+            # Record that a cancellation request was dispatched while an
+            # execute boundary might be in flight, so that the top frame's
+            # cancel_surface policy can be applied when the query completes.
+            self._cancel_generation += 1
 
     def _should_cancel(self) -> bool:
         """Check whether the current command should actually be cancelled when
@@ -318,6 +341,9 @@ class BaseConnection(Generic[Row]):
         cancel_conn = self.pgconn.cancel_conn()
         cancel_conn.start()
         yield from generators.cancel(cancel_conn)
+        # cancel_safe() also counts as a cancellation dispatched during a
+        # possible in-flight execute, for the frame cancel_surface policy.
+        self._cancel_generation += 1
 
     def add_notice_handler(self, callback: NoticeHandler) -> None:
         """
@@ -422,6 +448,61 @@ class BaseConnection(Generic[Row]):
         if value is None:
             value = sys.maxsize
         self._prepared.prepared_max = value
+
+    #
+    # Execution profile policy stack
+    #
+
+    @property
+    def profiles(self) -> ExecProfileStack:
+        """The connection-scoped stack of :class:`ExecProfile` frames.
+
+        The stack is owned by this connection instance: it is never shared
+        with other connections and does not use any process-global state.
+        """
+        return self._profiles
+
+    def exec_profile(
+        self,
+        profile: ExecProfile | None = None,
+        *,
+        autocommit_overlay: AutocommitOverlay | str = AutocommitOverlay.PIN,
+        pipeline_admit: PipelineAdmit | str = PipelineAdmit.PIN,
+        prepare_bind: PrepareBind | str = PrepareBind.PIN,
+        cancel_surface: CancelSurface | str = CancelSurface.PIN,
+    ) -> _ExecProfileContext:
+        """Push an :class:`ExecProfile` frame for the duration of a block.
+
+        The returned object works both as a sync context manager (``with
+        conn.exec_profile(...)`` on `Connection`) and as an async one
+        (``async with conn.exec_profile(...)`` on `AsyncConnection`), because
+        push/pop only touch connection-local state and perform no IO.
+
+        Axes left to their default keep the historical connection behaviour;
+        the frame is popped automatically on block exit, including the
+        exception path.
+        """
+        if profile is None:
+            profile = ExecProfile(
+                autocommit_overlay=autocommit_overlay,  # type: ignore[arg-type]
+                pipeline_admit=pipeline_admit,  # type: ignore[arg-type]
+                prepare_bind=prepare_bind,  # type: ignore[arg-type]
+                cancel_surface=cancel_surface,  # type: ignore[arg-type]
+            )
+        return _ExecProfileContext(self._profiles, profile)
+
+    def push_exec_profile(self, profile: ExecProfile) -> Any:
+        """Push a frame outside of a ``with``/``async with`` block.
+
+        Return an opaque token that *must* be passed back to
+        :meth:`pop_exec_profile`. Prefer :meth:`exec_profile`, which pops
+        automatically on the exception path.
+        """
+        return self._profiles.push(profile)
+
+    def pop_exec_profile(self, token: Any) -> None:
+        """Pop a frame previously pushed with :meth:`push_exec_profile`."""
+        self._profiles.pop(token)
 
     # Generators to perform high-level operations on the connection
     #
@@ -543,8 +624,43 @@ class BaseConnection(Generic[Row]):
         )
 
     def _start_query(self) -> PQGen[None]:
-        """Generator to start a transaction if necessary."""
+        """Generator to start a transaction if necessary.
+
+        This is the *pin* path, driven only by the connection flat
+        ``autocommit`` flag: internal machinery (transaction/savepoint/deallocate
+        commands) and the Copy operations read the execution profile stack
+        through this path, i.e. they explicitly do not subscribe to it.
+        """
         if self._autocommit:
+            return
+
+        if self.pgconn.transaction_status != IDLE:
+            return
+
+        yield from self._exec_command(self._get_tx_start_command())
+        if self._pipeline:
+            yield from self._pipeline._sync_gen()
+
+    def _start_query_profiled(self) -> PQGen[None]:
+        """Like `_start_query`, but reading the frame ``autocommit_overlay``.
+
+        Used by the execute family (Connection.execute, Cursor.execute and
+        executemany, server-side cursor declare/fetch and stream):
+
+        - ``force_on`` behaves as autocommit without ever mutating
+          ``self._autocommit`` (a bare command autocommits server-side when
+          no explicit transaction is open); executing inside an open
+          transaction raises instead of pretending success;
+        - ``force_off`` never relies on implicit autocommit: a BEGIN is
+          issued so that writes stay pending until an explicit commit or a
+          successful Transaction exit;
+        - ``pin`` is exactly the historical behaviour.
+        """
+        # force_on conflict is explicit here (the execute exit) as well as in
+        # push(), so that a frame cannot claim autocommit delivery inside a
+        # transaction that was opened around it.
+        effective_autocommit = self._profiles.effective_autocommit()
+        if effective_autocommit:
             return
 
         if self.pgconn.transaction_status != IDLE:

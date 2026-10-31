@@ -71,6 +71,10 @@ class Pipeline(BasePipeline):
         try:
             with self._lock:
                 self._conn.wait(self._exit_gen())
+                # Pipeline exit: force_sync_on_exit requires an observable,
+                # complete drain before the pipeline is left.
+                if self._profile_force_sync:
+                    self._verify_profile_force_sync()
         except Exception as exc2:
             # Don't clobber an exception raised in the block with this one
             if exc_val:

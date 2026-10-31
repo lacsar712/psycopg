@@ -19,6 +19,7 @@ from .rows import Row, RowMaker
 from ._column import Column
 from ._compat import Template
 from .pq.misc import connection_summary
+from ._profile import CancelSurface, PrepareBind
 from ._queries import PostgresClientQuery, PostgresQuery
 from ._preparing import Prepare
 from .generators import execute, fetch, send
@@ -49,7 +50,7 @@ class BaseCursor(Generic[ConnectionType, Row]):
     __slots__ = """
         _conn format _adapters arraysize _closed _results pgresult _pos
         _iresult _rowcount _query _tx _last_query _row_factory _make_row
-        _pgconn _execmany_returning _statusmessage
+        _pgconn _execmany_returning _statusmessage _exec_cancel_gen0
         __weakref__
         """.split()
 
@@ -66,6 +67,9 @@ class BaseCursor(Generic[ConnectionType, Row]):
         self.arraysize = 1
         self._closed = False
         self._last_query: Query | None = None
+        # Snapshot of conn._cancel_generation taken when an execute boundary
+        # starts sending; drives the frame cancel_surface policy.
+        self._exec_cancel_gen0 = 0
         self._reset()
 
         # Set up a callback to allow changing loaders on already returned result.
@@ -201,14 +205,25 @@ class BaseCursor(Generic[ConnectionType, Row]):
         binary: bool | None = None,
     ) -> PQGen[None]:
         """Generator implementing `Cursor.execute()`."""
+        # Execute exit: snapshot the cancel epoch *before* anything is sent,
+        # so that the frame cancel_surface policy can be applied to exactly
+        # this execute (and not to a cancel requested before it started).
+        self._exec_cancel_gen0 = self._conn._cancel_generation
         yield from self._start_query(query)
         pgq = self._convert_query(query, params)
         yield from self._maybe_prepare_gen(pgq, prepare=prepare, binary=binary)
         if self._conn._pipeline:
             yield from self._conn._pipeline._communicate_gen()
+            # Pipeline results were consumed by communicate(): a cancel
+            # signaled during this execute must still surface per frame.
+            self._raise_if_cancel_signaled()
 
         self._last_query = query
         yield from self._conn._prepared.maintain_gen(self._conn)
+        # Non-pipeline path already checked inside _maybe_prepare_gen(); run
+        # the check unconditionally too so a cancel racing the very end of the
+        # boundary is never reported as a plain success under raise_on_cancel.
+        self._raise_if_cancel_signaled()
 
     def _executemany_gen_pipeline(
         self, query: Query, params_seq: Iterable[Params], returning: bool
@@ -219,6 +234,7 @@ class BaseCursor(Generic[ConnectionType, Row]):
         pipeline = self._conn._pipeline
         assert pipeline
 
+        self._exec_cancel_gen0 = self._conn._cancel_generation
         yield from self._start_query(query)
         if not returning:
             self._rowcount = 0
@@ -237,6 +253,7 @@ class BaseCursor(Generic[ConnectionType, Row]):
 
             yield from self._maybe_prepare_gen(pgq, prepare=True)
             yield from pipeline._communicate_gen()
+            self._raise_if_cancel_signaled()
 
         self._last_query = query
 
@@ -244,6 +261,7 @@ class BaseCursor(Generic[ConnectionType, Row]):
             yield from pipeline._fetch_gen(flush=True)
 
         yield from self._conn._prepared.maintain_gen(self._conn)
+        self._raise_if_cancel_signaled()
 
     def _executemany_gen_no_pipeline(
         self, query: Query, params_seq: Iterable[Params], returning: bool
@@ -251,6 +269,7 @@ class BaseCursor(Generic[ConnectionType, Row]):
         """
         Generator implementing `Cursor.executemany()` with pipelines not available.
         """
+        self._exec_cancel_gen0 = self._conn._cancel_generation
         yield from self._start_query(query)
         if not returning:
             self._rowcount = 0
@@ -268,9 +287,11 @@ class BaseCursor(Generic[ConnectionType, Row]):
                 pgq.dump(params)
 
             yield from self._maybe_prepare_gen(pgq, prepare=True)
+            self._raise_if_cancel_signaled()
 
         self._last_query = query
         yield from self._conn._prepared.maintain_gen(self._conn)
+        self._raise_if_cancel_signaled()
 
     def _maybe_prepare_gen(
         self,
@@ -279,8 +300,19 @@ class BaseCursor(Generic[ConnectionType, Row]):
         prepare: bool | None = None,
         binary: bool | None = None,
     ) -> PQGen[None]:
-        # Check if the query is prepared or needs preparing
-        prep, name = self._get_prepared(pgq, prepare)
+        # Execute exit: read the prepare_bind axis independently from the
+        # autocommit/cancel axes.
+        prepare_bind = self._conn._profiles.prepare_bind
+        if prepare_bind is PrepareBind.FORCE_PREPARE:
+            # Same-shape repeats must take the named-statement path, even if
+            # prepare_threshold would disable preparing on the connection.
+            prep, name = self._conn._prepared.get_forced(pgq)
+        elif prepare_bind is PrepareBind.FORBID_PREPARE:
+            # Never hit nor populate the prepare cache.
+            prep, name = Prepare.NO, b""
+        else:
+            # Check if the query is prepared or needs preparing
+            prep, name = self._get_prepared(pgq, prepare)
         if prep is Prepare.NO:
             # The query must be executed without preparing
             self._execute_send(pgq, binary=binary)
@@ -296,10 +328,16 @@ class BaseCursor(Generic[ConnectionType, Row]):
             # Then execute it.
             self._send_query_prepared(name, pgq, binary=binary)
 
-        # Update the prepare state of the query.
+        # Update the prepare state of the query according to the frame policy.
         # If an operation requires to flush our prepared statements cache,
         # it will be added to the maintenance commands to execute later.
-        key = self._conn._prepared.maybe_add_to_cache(pgq, prep, name)
+        if prepare_bind is PrepareBind.FORBID_PREPARE:
+            # No cache lookup, no cache recording in this frame.
+            key = None
+        elif prepare_bind is PrepareBind.FORCE_PREPARE:
+            key = self._conn._prepared.maybe_add_forced(pgq, prep, name)
+        else:
+            key = self._conn._prepared.maybe_add_to_cache(pgq, prep, name)
 
         if self._conn._pipeline:
             queued = None
@@ -311,11 +349,67 @@ class BaseCursor(Generic[ConnectionType, Row]):
         # run the query
         results = yield from execute(self._pgconn)
 
+        # Execute exit: ignore_cancel_result may swallow a 57014 produced by a
+        # cancel dispatched after this execute sent its query.
+        if self._cancel_surface_suppress(results):
+            return
+
         if key is not None:
             self._conn._prepared.validate(key, prep, name, results)
 
         self._check_results(results)
         self._set_results(results)
+        # raise_on_cancel: a cancel after send must not complete as success.
+        self._raise_if_cancel_signaled()
+
+    #
+    # Cancel surface policy (execute-family exit)
+    #
+
+    @staticmethod
+    def _result_is_query_canceled(result: PGresult) -> bool:
+        return (
+            result.status == FATAL_ERROR
+            and result.error_field(pq.DiagnosticField.SQLSTATE) == b"57014"
+        )
+
+    def _cancel_dispatched_during_execute(self) -> bool:
+        return self._conn._cancel_generation > self._exec_cancel_gen0
+
+    def _cancel_surface_suppress(self, results: list[PGresult]) -> bool:
+        """Return `!True` if `results` must be ignored per the top frame.
+
+        Under ``cancel_surface=ignore_cancel_result``, if a cancellation was
+        dispatched after this execute sent its query and the server reports
+        ``57014``, swallow the result and leave the cursor in an empty
+        successful state instead of raising -- without closing the connection.
+        """
+        conn = self._conn
+        if conn._profiles.cancel_surface is not CancelSurface.IGNORE_CANCEL_RESULT:
+            return False
+        if not self._cancel_dispatched_during_execute():
+            return False
+        if not any(self._result_is_query_canceled(res) for res in results):
+            return False
+
+        self._reset(reset_query=False)
+        return True
+
+    def _raise_if_cancel_signaled(self) -> None:
+        """Raise QueryCanceled per ``cancel_surface=raise_on_cancel``.
+
+        Applies whenever a cancel was dispatched after the current execute
+        boundary sent its command, regardless of the result reported by the
+        server (including a benign success due to the cancel race).
+        """
+        conn = self._conn
+        if (
+            conn._profiles.cancel_surface is CancelSurface.RAISE_ON_CANCEL
+            and self._cancel_dispatched_during_execute()
+        ):
+            raise e.QueryCanceled(
+                "query canceled by cancel_surface=raise_on_cancel profile frame"
+            )
 
     def _get_prepared(
         self, pgq: PostgresQuery, prepare: bool | None = None
@@ -371,11 +465,18 @@ class BaseCursor(Generic[ConnectionType, Row]):
             # Errors, unexpected values
             return self._raise_for_result(res)
 
-    def _start_query(self, query: Query | None = None) -> PQGen[None]:
+    def _start_query(
+        self, query: Query | None = None, *, profile: bool = True
+    ) -> PQGen[None]:
         """Generator to start the processing of a query.
 
         It is implemented as generator because it may send additional queries,
         such as `begin`.
+
+        With ``profile=True`` (the execute family) the frame
+        ``autocommit_overlay`` drives the transaction start; Copy passes
+        ``profile=False`` because Copy/AsyncCopy explicitly do not subscribe
+        to the execution profile stack.
         """
         if self.closed:
             raise e.InterfaceError("the cursor is closed")
@@ -384,7 +485,13 @@ class BaseCursor(Generic[ConnectionType, Row]):
         if not self._last_query or (self._last_query is not query):
             self._last_query = None
             self._tx = adapt.Transformer(self)
-        yield from self._conn._start_query()
+        if profile:
+            # Execute-family exit (execute/executemany/stream/server cursor):
+            # read the frame autocommit_overlay here.
+            yield from self._conn._start_query_profiled()
+        else:
+            # Copy exit: pin path, connection flat autocommit only.
+            yield from self._conn._start_query()
 
     def _start_copy_gen(
         self, statement: Query, params: Params | None = None
@@ -396,7 +503,10 @@ class BaseCursor(Generic[ConnectionType, Row]):
         if self._conn._pipeline:
             raise e.NotSupportedError("COPY cannot be used in pipeline mode")
 
-        yield from self._start_query()
+        # Copy/AsyncCopy explicitly do NOT subscribe to the execution profile
+        # stack: transaction start is driven only by the connection flat
+        # autocommit flag (the pin path).
+        yield from self._start_query(profile=False)
 
         # Merge the params client-side
         if params or isinstance(statement, Template):

@@ -30,6 +30,7 @@ from ._compat import Self, Template
 from ._acompat import Lock
 from .conninfo import conninfo_attempts, conninfo_to_dict, make_conninfo
 from .conninfo import timeout_from_conninfo
+from ._profile import PipelineAdmit
 from ._pipeline import Pipeline
 from .generators import notifies
 from .transaction import Transaction
@@ -442,9 +443,22 @@ class Connection(BaseConnection[Row]):
         with self.lock:
             self._check_connection_ok()
 
+            # Pipeline entry exit: read the frame pipeline_admit axis (kept
+            # independent from execute's autocommit/prepare/cancel reads).
+            pipeline_admit = self._profiles.pipeline_admit
+            if pipeline_admit is PipelineAdmit.REJECT_ENTER:
+                raise e.ProgrammingError(
+                    "pipeline() rejected by the active execution profile"
+                    " (pipeline_admit=reject_enter): no pipeline is created"
+                    " and no command is enqueued"
+                )
+
             if (pipeline := self._pipeline) is None:
                 # WARNING: reference loop, broken ahead.
                 pipeline = self._pipeline = Pipeline(self)
+
+            if pipeline_admit is PipelineAdmit.FORCE_SYNC_ON_EXIT:
+                pipeline._profile_force_sync = True
 
         try:
             with pipeline:

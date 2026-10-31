@@ -32,6 +32,13 @@ from ._connection_base import BaseConnection, Notify
 from ._connection_info import ConnectionInfo
 from .connection_async import AsyncConnection
 from ._server_cursor_async import AsyncServerCursor
+from ._profile import (
+    AutocommitOverlay,
+    CancelSurface,
+    ExecProfile,
+    PipelineAdmit,
+    PrepareBind,
+)
 
 # Set the logger to a quiet default, can be enabled if needed
 if (logger := logging.getLogger("psycopg")).level == logging.NOTSET:
@@ -67,7 +74,9 @@ __all__ = [
     "AsyncRawServerCursor",
     "AsyncServerCursor",
     "AsyncTransaction",
+    "AutocommitOverlay",
     "BaseConnection",
+    "CancelSurface",
     "Capabilities",
     "capabilities",
     "ClientCursor",
@@ -76,9 +85,12 @@ __all__ = [
     "ConnectionInfo",
     "Copy",
     "Cursor",
+    "ExecProfile",
     "IsolationLevel",
     "Notify",
     "Pipeline",
+    "PipelineAdmit",
+    "PrepareBind",
     "RawCursor",
     "RawServerCursor",
     "Rollback",

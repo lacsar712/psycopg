@@ -79,6 +79,41 @@ class PrepareManager:
             # The query is not to be prepared yet
             return Prepare.NO, b""
 
+    def get_forced(self, query: PostgresQuery) -> tuple[Prepare, bytes]:
+        """Prepare decision for ``prepare_bind=force_prepare`` frames.
+
+        Unlike `get`, the connection ``prepare_threshold`` (even when
+        disabled, `!None`) is ignored: the first execution of a given shape
+        must create a named prepared statement (``SHOULD``) and subsequent
+        executions must reuse it (``YES``).
+        """
+        key = self.key(query)
+        if name := self._names.get(key):
+            return Prepare.YES, name
+
+        name = f"_pg3_{self._prepared_idx}".encode()
+        self._prepared_idx += 1
+        return Prepare.SHOULD, name
+
+    def maybe_add_forced(
+        self, query: PostgresQuery, prep: Prepare, name: bytes
+    ) -> Key | None:
+        """Cache update for ``prepare_bind=force_prepare`` frames.
+
+        Record the named statement even when automatic preparing is disabled
+        (``prepare_threshold is None``), so that same-shape repeats hit the
+        prepared statement instead of preparing again.
+        """
+        key = self.key(query)
+        if prep is Prepare.SHOULD:
+            self._counts.pop(key, None)
+            self._names[key] = name
+            return key
+
+        # The statement was expected to exist already; keep it recent.
+        self._names.move_to_end(key)
+        return None
+
     def _should_discard(
         self,
         prep: Prepare,

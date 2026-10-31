@@ -112,10 +112,18 @@ class ServerCursorMixin(BaseCursor[ConnectionType, Row]):
             self._described = False
 
         self._iter_rows = None
+        # Server-cursor execute exit: snapshot the cancel epoch for the frame
+        # cancel_surface policy (autocommit/prepare axes are read below via
+        # _start_query/_execute_send).
+        self._exec_cancel_gen0 = self._conn._cancel_generation
         yield from self._start_query(query)
         pgq = self._convert_query(query, params)
         self._execute_send(pgq, force_extended=True)
         results = yield from execute(self._conn.pgconn)
+        # ignore_cancel_result: a 57014 from a cancel dispatched after send
+        # leaves the execute without raising and without closing the conn.
+        if self._cancel_surface_suppress(results):
+            return
         if results[-1].status != COMMAND_OK:
             self._raise_for_result(results[-1])
 
@@ -127,6 +135,8 @@ class ServerCursorMixin(BaseCursor[ConnectionType, Row]):
 
         # The above result only returned COMMAND_OK. Get the cursor shape
         yield from self._describe_gen()
+        # raise_on_cancel: cancel after send must not look like a success.
+        self._raise_if_cancel_signaled()
 
     def _describe_gen(self) -> PQGen[None]:
         self._pgconn.send_describe_portal(self._name.encode(self._encoding))

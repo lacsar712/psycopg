@@ -14,6 +14,7 @@ from . import errors as e
 from . import pq
 from .abc import PipelineCommand, PQGen
 from .pq.misc import connection_summary
+from ._profile import PipelineAdmit
 from .generators import fetch_many, pipeline_communicate, send
 from ._capabilities import capabilities
 
@@ -47,6 +48,13 @@ class BasePipeline:
         self.command_queue = deque[PipelineCommand]()
         self.result_queue = deque[PendingResult]()
         self.level = 0
+        # Set by connection.pipeline() when a frame requires an observable
+        # sync/flush before this pipeline exits (pipeline_admit=
+        # force_sync_on_exit). Sticky for the pipeline object's lifetime:
+        # nested pipeline() blocks cannot weaken an outer frame requirement.
+        self._profile_force_sync = False
+        # Turned True only after a successful forced exit drained everything.
+        self._profile_force_synced = False
 
     def __repr__(self) -> str:
         cls = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
@@ -64,6 +72,18 @@ class BasePipeline:
 
     def _enter_gen(self) -> PQGen[None]:
         capabilities.has_pipeline(check=True)
+        # Pipeline exit: refuse to reach the enqueue state when the top frame
+        # rejects pipeline entry. connection.pipeline() gates this earlier,
+        # but a directly-instantiated Pipeline is covered here as well, before
+        # enter_pipeline_mode() is called.
+        if (
+            self.level == 0
+            and self._conn._profiles.pipeline_admit is PipelineAdmit.REJECT_ENTER
+        ):
+            raise e.ProgrammingError(
+                "pipeline entry rejected by execution profile"
+                " (pipeline_admit=reject_enter)"
+            )
         if self.level == 0:
             self.pgconn.enter_pipeline_mode()
         elif self.command_queue or self.pgconn.transaction_status == ACTIVE:
@@ -104,6 +124,22 @@ class BasePipeline:
             yield from self._communicate_gen()
         finally:
             yield from self._fetch_gen(flush=True)
+
+    def _verify_profile_force_sync(self) -> None:
+        """Verify the force_sync_on_exit guarantee at pipeline exit.
+
+        Called by the sync/async Pipeline context manager after the exit
+        sync: every queued command/result must have been drained; otherwise
+        raise instead of silently dropping unsynchronized commands.
+        """
+        if self.command_queue or self.result_queue:
+            raise e.ProgrammingError(
+                "pipeline exited with unsynchronized commands despite"
+                " pipeline_admit=force_sync_on_exit:"
+                f" {len(self.command_queue)} command(s) and"
+                f" {len(self.result_queue)} result slot(s) still queued"
+            )
+        self._profile_force_synced = True
 
     def _communicate_gen(self) -> PQGen[None]:
         """Communicate with pipeline to send commands and possibly fetch
@@ -172,6 +208,10 @@ class BasePipeline:
                 key, prep, name = prepinfo
                 # Update the prepare state of the query.
                 cursor._conn._prepared.validate(key, prep, name, results)
+            # Pipeline execute exit: honor the frame ignore_cancel_result
+            # policy for results delivered through the pipeline.
+            if cursor._cancel_surface_suppress(results):
+                return
             cursor._check_results(results)
             cursor._set_results(results)
 
