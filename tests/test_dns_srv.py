@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import random
+from typing import TYPE_CHECKING
+from collections import Counter
+
 import pytest
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
 from .test_dns import import_dnspython
+
+if TYPE_CHECKING:
+    import psycopg._dns
 
 pytestmark = [pytest.mark.dns]
 
@@ -43,12 +50,11 @@ samples_ok = [
 ]
 
 
-@pytest.mark.flakey("random weight order, might cause wrong order")
 @pytest.mark.parametrize("conninfo, want, env", samples_ok)
 def test_srv(conninfo, want, env, fake_srv, setpgenv):
     setpgenv(env)
     params = conninfo_to_dict(conninfo)
-    params = psycopg._dns.resolve_srv(params)  # type: ignore[attr-defined]
+    params = psycopg._dns.resolve_srv(params)
     assert conninfo_to_dict(want) == params
 
 
@@ -57,7 +63,7 @@ def test_srv(conninfo, want, env, fake_srv, setpgenv):
 async def test_srv_async(conninfo, want, env, afake_srv, setpgenv):
     setpgenv(env)
     params = conninfo_to_dict(conninfo)
-    params = await psycopg._dns.resolve_srv_async(params)  # type: ignore[attr-defined]
+    params = await psycopg._dns.resolve_srv_async(params)
     assert conninfo_to_dict(want) == params
 
 
@@ -72,7 +78,7 @@ def test_srv_bad(conninfo, env, fake_srv, setpgenv):
     setpgenv(env)
     params = conninfo_to_dict(conninfo)
     with pytest.raises(psycopg.OperationalError):
-        psycopg._dns.resolve_srv(params)  # type: ignore[attr-defined]
+        psycopg._dns.resolve_srv(params)
 
 
 @pytest.mark.anyio
@@ -81,14 +87,66 @@ async def test_srv_bad_async(conninfo, env, afake_srv, setpgenv):
     setpgenv(env)
     params = conninfo_to_dict(conninfo)
     with pytest.raises(psycopg.OperationalError):
-        await psycopg._dns.resolve_srv_async(params)  # type: ignore[attr-defined]
+        await psycopg._dns.resolve_srv_async(params)
+
+
+def make_srvs(*entries):
+    import_dnspython()
+    from dns.rdtypes.IN.SRV import SRV
+
+    return [
+        SRV("IN", "SRV", pri, weight, 5432, f"{name}.example.com.")
+        for name, pri, weight in entries
+    ]
+
+
+# Entries with priority 0 are shuffled; z, the only one with priority 1, goes last.
+weighted_srvs = [("z", 1, 5), ("c", 0, 20), ("a", 0, 0), ("b", 0, 10)]
+
+
+@pytest.mark.parametrize(
+    "draws, totals, want",
+    [
+        # Sorted by weight, the running sums are a: 0, b: 10, c: 30.
+        ([0, 10, 20], [30, 30, 20], "abcz"),
+        ([1, 0, 0], [30, 20, 20], "bacz"),
+        ([10, 11, 0], [30, 20, 0], "bcaz"),
+        ([11, 0, 0], [30, 10, 10], "cabz"),
+        ([30, 10, 0], [30, 10, 0], "cbaz"),
+    ],
+)
+def test_sort_rfc2782(draws, totals, want, monkeypatch):
+    srvs = make_srvs(*weighted_srvs)
+    calls = []
+
+    def fake_randint(a, b):
+        calls.append((a, b))
+        return draws[len(calls) - 1]
+
+    monkeypatch.setattr(psycopg._dns, "randint", fake_randint)
+    resolver = psycopg._dns.Rfc2782Resolver()
+    rv = resolver.sort_rfc2782(srvs)
+    assert "".join(str(ent.target)[0] for ent in rv) == want
+    assert calls == [(0, t) for t in totals]
+
+
+def test_sort_rfc2782_distribution(monkeypatch):
+    srvs = make_srvs(*weighted_srvs)
+    monkeypatch.setattr(psycopg._dns, "randint", random.Random(42).randint)
+    resolver = psycopg._dns.Rfc2782Resolver()
+    n = 3000
+    firsts = Counter(str(resolver.sort_rfc2782(srvs)[0].target)[0] for _ in range(n))
+    # randint(0, 30): a is picked only on 0, then b on 1-10 and c on 11-30.
+    assert firsts["a"] / n == pytest.approx(1 / 31, abs=0.02)
+    assert firsts["b"] / n == pytest.approx(10 / 31, abs=0.03)
+    assert firsts["c"] / n == pytest.approx(20 / 31, abs=0.03)
 
 
 @pytest.fixture
 def fake_srv(monkeypatch):
     f = get_fake_srv_function(monkeypatch)
     monkeypatch.setattr(
-        psycopg._dns.resolver,  # type: ignore[attr-defined]
+        psycopg._dns.resolver,
         "resolve",
         f,
     )
@@ -102,7 +160,7 @@ def afake_srv(monkeypatch):
         return f(qname, rdtype)
 
     monkeypatch.setattr(
-        psycopg._dns.async_resolver,  # type: ignore[attr-defined]
+        psycopg._dns.async_resolver,
         "resolve",
         af,
     )
@@ -114,6 +172,10 @@ def get_fake_srv_function(monkeypatch):
     from dns.exception import DNSException
     from dns.rdtypes.IN.A import A
     from dns.rdtypes.IN.SRV import SRV
+
+    # Make the RFC 2782 weighted shuffle deterministic: always drawing the
+    # top of the range selects the heaviest remaining entry.
+    monkeypatch.setattr(psycopg._dns, "randint", lambda a, b: b)
 
     fake_hosts = {
         ("_pg._tcp.dot.com", "SRV"): ["0 0 5432 ."],
